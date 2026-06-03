@@ -73,7 +73,15 @@ func insertEvents(ctx context.Context, tx *sql.Tx, tableName string, instance *c
 func removeFutureEvent(ctx context.Context, tx *sql.Tx, instance *core.WorkflowInstance, scheduleEventID int64) error {
 	_, err := tx.ExecContext(
 		ctx,
-		"DELETE `pending_events`, `attributes` FROM `pending_events` INNER JOIN `attributes` ON `pending_events`.event_id = `attributes`.event_id WHERE `pending_events`.instance_id = ? AND `pending_events`.execution_id = ? AND `pending_events`.schedule_event_id = ? AND `pending_events`.visible_at IS NOT NULL",
+		`DELETE pending_events, attributes
+			FROM pending_events
+			INNER JOIN attributes ON pending_events.event_id = attributes.event_id
+				AND pending_events.instance_id = attributes.instance_id
+				AND pending_events.execution_id = attributes.execution_id
+			WHERE pending_events.instance_id = ?
+				AND pending_events.execution_id = ?
+				AND pending_events.schedule_event_id = ?
+				AND pending_events.visible_at IS NOT NULL`,
 		instance.InstanceID,
 		instance.ExecutionID,
 		scheduleEventID,

@@ -13,6 +13,10 @@ type options struct {
 
 	// ApplyMigrations automatically applies database migrations on startup.
 	ApplyMigrations bool
+
+	// TaskClaimBatchSize controls how many candidate rows are inspected when
+	// optimistically claiming workflow or activity tasks.
+	TaskClaimBatchSize int
 }
 
 type option func(*options)
@@ -27,6 +31,16 @@ func WithApplyMigrations(applyMigrations bool) option {
 func WithMySQLOptions(f func(db *sql.DB)) option {
 	return func(o *options) {
 		o.MySQLOptions = f
+	}
+}
+
+// WithTaskClaimBatchSize sets how many candidates are tried during optimistic
+// task claiming. Values less than 1 keep the default.
+func WithTaskClaimBatchSize(size int) option {
+	return func(o *options) {
+		if size > 0 {
+			o.TaskClaimBatchSize = size
+		}
 	}
 }
 

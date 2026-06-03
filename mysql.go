@@ -28,17 +28,20 @@ import (
 //go:embed db/migrations/*.sql
 var migrationsFS embed.FS
 
+const defaultTaskClaimBatchSize = 16
+
 func NewMysqlBackend(host string, port int, user, password, database string, opts ...option) *mysqlBackend {
 	options := &options{
-		Options:         backend.ApplyOptions(),
-		ApplyMigrations: true,
+		Options:            backend.ApplyOptions(),
+		ApplyMigrations:    true,
+		TaskClaimBatchSize: defaultTaskClaimBatchSize,
 	}
 
 	for _, opt := range opts {
 		opt(options)
 	}
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true", user, password, host, port, database)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&interpolateParams=true&time_zone=%%27%%2B00%%3A00%%27", user, password, host, port, database)
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -81,17 +84,36 @@ func (mb *mysqlBackend) Close() error {
 }
 
 // Migrate applies any pending database migrations.
-func (mb *mysqlBackend) Migrate() error {
+func (mb *mysqlBackend) Migrate() (err error) {
 	schemaDsn := mb.dsn + "&multiStatements=true"
 	db, err := sql.Open("mysql", schemaDsn)
 	if err != nil {
 		return fmt.Errorf("opening schema database: %w", err)
 	}
 
+	dbOwnedByMigrationDriver := false
+	defer func() {
+		if !dbOwnedByMigrationDriver {
+			if closeErr := db.Close(); err == nil && closeErr != nil {
+				err = fmt.Errorf("closing schema database: %w", closeErr)
+			}
+		}
+	}()
+
 	dbi, err := mysql.WithInstance(db, &mysql.Config{})
 	if err != nil {
 		return fmt.Errorf("creating migration instance: %w", err)
 	}
+	dbOwnedByMigrationDriver = true
+
+	driverOwnedByMigrate := false
+	defer func() {
+		if !driverOwnedByMigrate {
+			if closeErr := dbi.Close(); err == nil && closeErr != nil {
+				err = fmt.Errorf("closing migration database: %w", closeErr)
+			}
+		}
+	}()
 
 	migrations, err := iofs.New(migrationsFS, "db/migrations")
 	if err != nil {
@@ -102,15 +124,22 @@ func (mb *mysqlBackend) Migrate() error {
 	if err != nil {
 		return fmt.Errorf("creating migration: %w", err)
 	}
+	driverOwnedByMigrate = true
+	defer func() {
+		sourceErr, databaseErr := m.Close()
+		if err == nil {
+			if sourceErr != nil {
+				err = fmt.Errorf("closing migration source: %w", sourceErr)
+			} else if databaseErr != nil {
+				err = fmt.Errorf("closing migration database: %w", databaseErr)
+			}
+		}
+	}()
 
 	if err := m.Up(); err != nil {
 		if !errors.Is(err, migrate.ErrNoChange) {
 			return fmt.Errorf("running migrations: %w", err)
 		}
-	}
-
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("closing schema database: %w", err)
 	}
 
 	return nil
@@ -177,6 +206,7 @@ func (mb *mysqlBackend) removeWorkflowInstance(ctx context.Context, instance *co
 		if err == sql.ErrNoRows {
 			return backend.ErrInstanceNotFound
 		}
+		return err
 	}
 
 	if state == core.WorkflowInstanceStateActive {
@@ -209,6 +239,7 @@ func (mb *mysqlBackend) RemoveWorkflowInstances(ctx context.Context, options ...
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 
 	instanceIDs := []string{}
 	executionIDs := []string{}
@@ -227,6 +258,9 @@ func (mb *mysqlBackend) RemoveWorkflowInstances(ctx context.Context, options ...
 	}
 
 	batchSize := ro.BatchSize
+	if batchSize <= 0 {
+		batchSize = backend.DefaultRemovalOptions.BatchSize
+	}
 	for i := 0; i < len(instanceIDs); i += batchSize {
 		instanceIDs := instanceIDs[i:min(i+batchSize, len(instanceIDs))]
 		executionIDs := executionIDs[i:min(i+batchSize, len(executionIDs))]
@@ -236,32 +270,31 @@ func (mb *mysqlBackend) RemoveWorkflowInstances(ctx context.Context, options ...
 			return err
 		}
 
-		defer tx.Rollback()
-
-		placeholders := strings.Repeat(",?", len(instanceIDs)-1)
-		whereCondition := fmt.Sprintf("instance_id IN (?%v) AND execution_id IN (?%v)", placeholders, placeholders)
+		placeholders := strings.Repeat(", (?, ?)", len(instanceIDs)-1)
+		whereCondition := fmt.Sprintf("(instance_id, execution_id) IN ((?, ?)%v)", placeholders)
 		args := make([]interface{}, 0, len(instanceIDs)*2)
 		for i := range instanceIDs {
-			args = append(args, instanceIDs[i])
-		}
-		for i := range executionIDs {
-			args = append(args, executionIDs[i])
+			args = append(args, instanceIDs[i], executionIDs[i])
 		}
 
 		// Delete from instances, history and attributes tables
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM `instances` WHERE %v", whereCondition), args...); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM `history` WHERE %v", whereCondition), args...); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM `attributes` WHERE %v", whereCondition), args...); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 
 		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
 			return err
 		}
 	}
@@ -375,6 +408,7 @@ func (mb *mysqlBackend) GetWorkflowInstanceState(ctx context.Context, instance *
 		if err == sql.ErrNoRows {
 			return core.WorkflowInstanceStateActive, backend.ErrInstanceNotFound
 		}
+		return core.WorkflowInstanceStateActive, err
 	}
 
 	return state, nil
@@ -382,13 +416,17 @@ func (mb *mysqlBackend) GetWorkflowInstanceState(ctx context.Context, instance *
 
 func createInstance(ctx context.Context, tx *sql.Tx, queue workflow.Queue, wfi *workflow.Instance, metadata *workflow.Metadata) error {
 	// Check for existing instance
-	if err := tx.QueryRowContext(
+	err := tx.QueryRowContext(
 		ctx,
 		"SELECT 1 FROM `instances` WHERE instance_id = ? AND state = ? LIMIT 1",
 		wfi.InstanceID,
 		core.WorkflowInstanceStateActive).
-		Scan(new(int)); err != sql.ErrNoRows {
+		Scan(new(int))
+	if err == nil {
 		return backend.ErrInstanceAlreadyExists
+	}
+	if err != sql.ErrNoRows {
+		return err
 	}
 
 	var parentInstanceID, parentExecutionID *string
@@ -436,8 +474,11 @@ func (mb *mysqlBackend) SignalWorkflow(ctx context.Context, instanceID string, e
 	// TODO: Combine this with the event insertion
 	res := tx.QueryRowContext(ctx, "SELECT execution_id FROM `instances` WHERE instance_id = ? AND state = ? LIMIT 1", instanceID, core.WorkflowInstanceStateActive)
 	var executionID string
-	if err := res.Scan(&executionID); err == sql.ErrNoRows {
-		return backend.ErrInstanceNotFound
+	if err := res.Scan(&executionID); err != nil {
+		if err == sql.ErrNoRows {
+			return backend.ErrInstanceNotFound
+		}
+		return err
 	}
 
 	instance := core.NewWorkflowInstance(instanceID, executionID)
@@ -463,6 +504,10 @@ func (mb *mysqlBackend) PrepareActivityQueues(ctx context.Context, queues []work
 // select a candidate, then lock it with a conditional UPDATE. If another poller
 // wins the race first, RowsAffected is 0 and the worker can poll again later.
 func (mb *mysqlBackend) GetWorkflowTask(ctx context.Context, queues []workflow.Queue) (*backend.WorkflowTask, error) {
+	if len(queues) == 0 {
+		return nil, nil
+	}
+
 	tx, err := mb.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelReadCommitted,
 	})
@@ -472,12 +517,10 @@ func (mb *mysqlBackend) GetWorkflowTask(ctx context.Context, queues []workflow.Q
 	defer tx.Rollback()
 
 	now := time.Now()
-	lockUntil := now.Add(mb.options.WorkflowLockTimeout)
+	lockToken := uuid.NewString()
 	args := []any{
 		core.WorkflowInstanceStateActive, // state
 		now,                              // event.visible_at
-		now,                              // locked_until
-		now,                              // sticky_until
 		mb.workerName,                    // worker
 	}
 
@@ -486,59 +529,89 @@ func (mb *mysqlBackend) GetWorkflowTask(ctx context.Context, queues []workflow.Q
 		args = append(args, string(q))
 	}
 
-	// Find a candidate workflow task. This is intentionally not FOR UPDATE:
+	// Find candidate workflow tasks. This is intentionally not FOR UPDATE:
 	// MySQL 5.7 cannot skip locked rows, so the conditional UPDATE below is
 	// the actual claim step.
-	row := tx.QueryRowContext(
+	rows, err := tx.QueryContext(
 		ctx,
-		fmt.Sprintf(`SELECT i.id
+		fmt.Sprintf(`SELECT DISTINCT i.id
 			FROM instances i
 			INNER JOIN pending_events pe ON i.instance_id = pe.instance_id AND i.execution_id = pe.execution_id
 			WHERE
 				i.state = ? AND i.completed_at IS NULL
 				AND (pe.visible_at IS NULL OR pe.visible_at <= ?)
-				AND (i.locked_until IS NULL OR i.locked_until < ?)
-				AND (i.sticky_until IS NULL OR i.sticky_until < ? OR i.worker = ?)
+				AND (i.locked_until IS NULL OR i.locked_until < CURRENT_TIMESTAMP(6))
+				AND (i.sticky_until IS NULL OR i.sticky_until < CURRENT_TIMESTAMP(6) OR i.worker = ?)
 				AND (i.queue in (?%s))
 			ORDER BY i.id
-			LIMIT 1
+			LIMIT ?
 			`, queuePlaceholders),
-		args...,
-	)
-
-	var id int
-	if err := row.Scan(&id); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("finding workflow instance to lock: %w", err)
-	}
-
-	res, err := tx.ExecContext(
-		ctx,
-		`UPDATE instances i
-			SET locked_until = ?, worker = ?
-			WHERE id = ?
-				AND state = ?
-				AND completed_at IS NULL
-				AND (locked_until IS NULL OR locked_until < ?)
-				AND (sticky_until IS NULL OR sticky_until < ? OR worker = ?)`,
-		lockUntil,
-		mb.workerName,
-		id,
-		core.WorkflowInstanceStateActive,
-		now,
-		now,
-		mb.workerName,
+		append(args, mb.options.TaskClaimBatchSize)...,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("locking workflow instance: %w", err)
+		return nil, fmt.Errorf("finding workflow instances to lock: %w", err)
 	}
 
-	if affectedRows, err := res.RowsAffected(); err != nil {
-		return nil, fmt.Errorf("locking workflow instance: %w", err)
-	} else if affectedRows == 0 {
+	candidateIDs := make([]int64, 0, mb.options.TaskClaimBatchSize)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning workflow instance candidate: %w", err)
+		}
+
+		candidateIDs = append(candidateIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("reading workflow instance candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing workflow instance candidates: %w", err)
+	}
+
+	var id int64
+	for _, candidateID := range candidateIDs {
+		res, err := tx.ExecContext(
+			ctx,
+			`UPDATE instances i
+				SET locked_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND), worker = ?, lock_token = ?
+				WHERE id = ?
+					AND state = ?
+					AND completed_at IS NULL
+					AND (locked_until IS NULL OR locked_until < CURRENT_TIMESTAMP(6))
+					AND (sticky_until IS NULL OR sticky_until < CURRENT_TIMESTAMP(6) OR worker = ?)
+					AND EXISTS (
+						SELECT 1 FROM pending_events pe
+						WHERE pe.instance_id = i.instance_id
+							AND pe.execution_id = i.execution_id
+							AND (pe.visible_at IS NULL OR pe.visible_at <= ?)
+					)`,
+			durationMicros(mb.options.WorkflowLockTimeout),
+			mb.workerName,
+			lockToken,
+			candidateID,
+			core.WorkflowInstanceStateActive,
+			mb.workerName,
+			now,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("locking workflow instance: %w", err)
+		}
+
+		affectedRows, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("locking workflow instance: %w", err)
+		}
+		if affectedRows == 1 {
+			id = candidateID
+			break
+		}
+		if affectedRows > 1 {
+			return nil, fmt.Errorf("locking workflow instance: updated %d rows", affectedRows)
+		}
+	}
+	if id == 0 {
 		return nil, nil
 	}
 
@@ -547,13 +620,14 @@ func (mb *mysqlBackend) GetWorkflowTask(ctx context.Context, queues []workflow.Q
 	var parentEventID *int64
 	var metadataJson sql.NullString
 	var stickyUntil *time.Time
-	row = tx.QueryRowContext(
+	row := tx.QueryRowContext(
 		ctx,
 		`SELECT i.queue, i.instance_id, i.execution_id, i.parent_instance_id, i.parent_execution_id, i.parent_schedule_event_id, i.metadata, i.sticky_until
 			FROM instances i
-			WHERE i.id = ? AND i.worker = ?`,
+			WHERE i.id = ? AND i.worker = ? AND i.lock_token = ?`,
 		id,
 		mb.workerName,
+		lockToken,
 	)
 	if err := row.Scan(&queue, &instanceID, &executionID, &parentInstanceID, &parentExecutionID, &parentEventID, &metadataJson, &stickyUntil); err != nil {
 		if err == sql.ErrNoRows {
@@ -584,6 +658,7 @@ func (mb *mysqlBackend) GetWorkflowTask(ctx context.Context, queues []workflow.Q
 		Metadata:              metadata,
 		NewEvents:             []*history.Event{},
 		Queue:                 workflow.Queue(queue),
+		CustomData:            lockToken,
 	}
 
 	// Get new events
@@ -679,6 +754,10 @@ func (mb *mysqlBackend) CompleteWorkflowTask(
 	defer tx.Rollback()
 
 	instance := task.WorkflowInstance
+	lockToken, err := workflowTaskLockToken(task)
+	if err != nil {
+		return err
+	}
 
 	// Unlock instance, but keep it sticky to the current worker
 	var completedAt *time.Time
@@ -689,13 +768,20 @@ func (mb *mysqlBackend) CompleteWorkflowTask(
 
 	res, err := tx.ExecContext(
 		ctx,
-		`UPDATE instances SET locked_until = NULL, sticky_until = ?, completed_at = ?, state = ? WHERE instance_id = ? AND execution_id = ? AND worker = ?`,
-		time.Now().Add(mb.options.StickyTimeout),
+		`UPDATE instances
+			SET locked_until = NULL,
+				lock_token = NULL,
+				sticky_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND),
+				completed_at = ?,
+				state = ?
+			WHERE instance_id = ? AND execution_id = ? AND worker = ? AND lock_token = ? AND locked_until > CURRENT_TIMESTAMP(6)`,
+		durationMicros(mb.options.StickyTimeout),
 		completedAt,
 		state,
 		instance.InstanceID,
 		instance.ExecutionID,
 		mb.workerName,
+		lockToken,
 	)
 	if err != nil {
 		return fmt.Errorf("unlocking instance: %w", err)
@@ -820,14 +906,21 @@ func (mb *mysqlBackend) ExtendWorkflowTask(ctx context.Context, task *backend.Wo
 	}
 	defer tx.Rollback()
 
-	until := time.Now().Add(mb.options.WorkflowLockTimeout)
+	lockToken, err := workflowTaskLockToken(task)
+	if err != nil {
+		return err
+	}
+
 	res, err := tx.ExecContext(
 		ctx,
-		`UPDATE instances SET locked_until = ? WHERE instance_id = ? AND execution_id = ? AND worker = ?`,
-		until,
+		`UPDATE instances
+			SET locked_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+			WHERE instance_id = ? AND execution_id = ? AND worker = ? AND lock_token = ? AND locked_until > CURRENT_TIMESTAMP(6)`,
+		durationMicros(mb.options.WorkflowLockTimeout),
 		task.WorkflowInstance.InstanceID,
 		task.WorkflowInstance.ExecutionID,
 		mb.workerName,
+		lockToken,
 	)
 	if err != nil {
 		return fmt.Errorf("extending workflow task lock: %w", err)
@@ -835,8 +928,8 @@ func (mb *mysqlBackend) ExtendWorkflowTask(ctx context.Context, task *backend.Wo
 
 	if rowsAffected, err := res.RowsAffected(); err != nil {
 		return fmt.Errorf("determining if workflow task was extended: %w", err)
-	} else if rowsAffected == 0 {
-		return errors.New("could not extend workflow task")
+	} else if rowsAffected != 1 {
+		return fmt.Errorf("could not extend workflow task, updated %d rows", rowsAffected)
 	}
 
 	return tx.Commit()
@@ -844,6 +937,10 @@ func (mb *mysqlBackend) ExtendWorkflowTask(ctx context.Context, task *backend.Wo
 
 // GetActivityTask returns a pending activity task or nil if there are no pending activities.
 func (mb *mysqlBackend) GetActivityTask(ctx context.Context, queues []workflow.Queue) (*backend.ActivityTask, error) {
+	if len(queues) == 0 {
+		return nil, nil
+	}
+
 	tx, err := mb.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelReadCommitted,
 	})
@@ -855,7 +952,7 @@ func (mb *mysqlBackend) GetActivityTask(ctx context.Context, queues []workflow.Q
 	queuePlaceholders := strings.Repeat(",?", len(queues)-1)
 
 	now := time.Now()
-	lockUntil := now.Add(mb.options.ActivityLockTimeout)
+	lockToken := uuid.NewString()
 
 	args := make([]interface{}, 0, len(queues)+1)
 	args = append(args, now)
@@ -863,54 +960,85 @@ func (mb *mysqlBackend) GetActivityTask(ctx context.Context, queues []workflow.Q
 		args = append(args, string(q))
 	}
 
-	res := tx.QueryRowContext(
+	rows, err := tx.QueryContext(
 		ctx,
 		fmt.Sprintf(`SELECT a.id
 			FROM activities a
-			WHERE (a.locked_until IS NULL OR a.locked_until < ?) AND a.queue IN (?%s)
+			WHERE (a.locked_until IS NULL OR a.locked_until < CURRENT_TIMESTAMP(6))
+				AND (a.visible_at IS NULL OR a.visible_at <= ?)
+				AND a.queue IN (?%s)
 			ORDER BY a.id
-			LIMIT 1
+			LIMIT ?
 			`, queuePlaceholders),
-		args...,
-	)
-
-	var id int64
-	if err := res.Scan(&id); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("finding activity task to lock: %w", err)
-	}
-
-	update, err := tx.ExecContext(
-		ctx,
-		`UPDATE activities SET locked_until = ?, worker = ?
-			WHERE id = ? AND (locked_until IS NULL OR locked_until < ?)`,
-		lockUntil,
-		mb.workerName,
-		id,
-		now,
+		append(args, mb.options.TaskClaimBatchSize)...,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("locking activity: %w", err)
+		return nil, fmt.Errorf("finding activity tasks to lock: %w", err)
 	}
 
-	if affectedRows, err := update.RowsAffected(); err != nil {
-		return nil, fmt.Errorf("locking activity: %w", err)
-	} else if affectedRows == 0 {
+	candidateIDs := make([]int64, 0, mb.options.TaskClaimBatchSize)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning activity candidate: %w", err)
+		}
+
+		candidateIDs = append(candidateIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("reading activity candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing activity candidates: %w", err)
+	}
+
+	var id int64
+	for _, candidateID := range candidateIDs {
+		update, err := tx.ExecContext(
+			ctx,
+			`UPDATE activities
+				SET locked_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND), worker = ?, lock_token = ?
+				WHERE id = ?
+					AND (locked_until IS NULL OR locked_until < CURRENT_TIMESTAMP(6))
+					AND (visible_at IS NULL OR visible_at <= ?)`,
+			durationMicros(mb.options.ActivityLockTimeout),
+			mb.workerName,
+			lockToken,
+			candidateID,
+			now,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("locking activity: %w", err)
+		}
+
+		affectedRows, err := update.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("locking activity: %w", err)
+		}
+		if affectedRows == 1 {
+			id = candidateID
+			break
+		}
+		if affectedRows > 1 {
+			return nil, fmt.Errorf("locking activity: updated %d rows", affectedRows)
+		}
+	}
+	if id == 0 {
 		return nil, nil
 	}
 
-	res = tx.QueryRowContext(
+	res := tx.QueryRowContext(
 		ctx,
 		`SELECT a.activity_id, a.instance_id, a.execution_id, a.queue,
 			a.event_type, a.timestamp, a.schedule_event_id, at.data, a.visible_at
 			FROM activities a
 			JOIN attributes at ON at.event_id = a.activity_id AND at.instance_id = a.instance_id AND at.execution_id = a.execution_id
-			WHERE a.id = ? AND a.worker = ?`,
+			WHERE a.id = ? AND a.worker = ? AND a.lock_token = ?`,
 		id,
 		mb.workerName,
+		lockToken,
 	)
 
 	var instanceID, executionID, queue string
@@ -935,7 +1063,7 @@ func (mb *mysqlBackend) GetActivityTask(ctx context.Context, queues []workflow.Q
 	event.Attributes = a
 
 	t := &backend.ActivityTask{
-		ID:               event.ID,
+		ID:               lockToken,
 		ActivityID:       event.ID,
 		Queue:            workflow.Queue(queue),
 		WorkflowInstance: core.NewWorkflowInstance(instanceID, executionID),
@@ -960,14 +1088,21 @@ func (mb *mysqlBackend) CompleteActivityTask(ctx context.Context, task *backend.
 	defer tx.Rollback()
 
 	// Remove activity
+	lockToken, err := activityTaskLockToken(task)
+	if err != nil {
+		return err
+	}
+
 	if res, err := tx.ExecContext(
 		ctx,
-		`DELETE FROM activities WHERE activity_id = ? AND instance_id = ? AND execution_id = ? AND worker = ? AND queue = ?`,
+		`DELETE FROM activities
+			WHERE activity_id = ? AND instance_id = ? AND execution_id = ? AND worker = ? AND queue = ? AND lock_token = ? AND locked_until > CURRENT_TIMESTAMP(6)`,
 		task.ActivityID,
 		task.WorkflowInstance.InstanceID,
 		task.WorkflowInstance.ExecutionID,
 		mb.workerName,
 		task.Queue,
+		lockToken,
 	); err != nil {
 		return fmt.Errorf("completing activity: %w", err)
 	} else {
@@ -976,8 +1111,8 @@ func (mb *mysqlBackend) CompleteActivityTask(ctx context.Context, task *backend.
 			return fmt.Errorf("checking for completed activity: %w", err)
 		}
 
-		if affected == 0 {
-			return errors.New("could not find locked activity")
+		if affected != 1 {
+			return fmt.Errorf("could not find locked activity, deleted %d rows", affected)
 		}
 	}
 
@@ -1000,27 +1135,41 @@ func (mb *mysqlBackend) ExtendActivityTask(ctx context.Context, task *backend.Ac
 	}
 	defer tx.Rollback()
 
-	until := time.Now().Add(mb.options.ActivityLockTimeout)
-	_, err = tx.ExecContext(
+	lockToken, err := activityTaskLockToken(task)
+	if err != nil {
+		return err
+	}
+
+	res, err := tx.ExecContext(
 		ctx,
-		`UPDATE activities SET locked_until = ? WHERE activity_id = ? AND worker = ?`,
-		until,
+		`UPDATE activities
+			SET locked_until = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+			WHERE activity_id = ?
+				AND instance_id = ?
+				AND execution_id = ?
+				AND worker = ?
+				AND queue = ?
+				AND lock_token = ?
+				AND locked_until > CURRENT_TIMESTAMP(6)`,
+		durationMicros(mb.options.ActivityLockTimeout),
 		task.ActivityID,
+		task.WorkflowInstance.InstanceID,
+		task.WorkflowInstance.ExecutionID,
 		mb.workerName,
+		task.Queue,
+		lockToken,
 	)
 	if err != nil {
 		return fmt.Errorf("extending activity lock: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		if errors.Is(err, sql.ErrTxDone) {
-			return nil
-		}
-
-		return err
+	if rowsAffected, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("determining if activity task was extended: %w", err)
+	} else if rowsAffected != 1 {
+		return fmt.Errorf("could not extend activity task, updated %d rows", rowsAffected)
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func scheduleActivity(ctx context.Context, tx *sql.Tx, queue workflow.Queue, instance *core.WorkflowInstance, event *history.Event) error {
@@ -1048,6 +1197,27 @@ func getWorkerName(options *options) string {
 		return options.WorkerName
 	}
 	return fmt.Sprintf("worker-%v", uuid.NewString())
+}
+
+func workflowTaskLockToken(task *backend.WorkflowTask) (string, error) {
+	lockToken, ok := task.CustomData.(string)
+	if !ok || lockToken == "" {
+		return "", errors.New("workflow task is missing lock token")
+	}
+
+	return lockToken, nil
+}
+
+func activityTaskLockToken(task *backend.ActivityTask) (string, error) {
+	if task.ID == "" {
+		return "", errors.New("activity task is missing lock token")
+	}
+
+	return task.ID, nil
+}
+
+func durationMicros(duration time.Duration) int64 {
+	return duration.Microseconds()
 }
 
 func toWorkflowError(err error) *workflow.Error {

@@ -42,9 +42,9 @@ func (mb *mysqlBackend) GetStats(ctx context.Context) (*backend.Stats, error) {
 	now := time.Now()
 	workflowRows, err := tx.QueryContext(
 		ctx,
-		`SELECT i.queue, COUNT(*)
+		`SELECT i.queue, COUNT(DISTINCT i.id)
 			FROM instances i
-			INNER JOIN pending_events pe ON i.instance_id = pe.instance_id
+			INNER JOIN pending_events pe ON i.instance_id = pe.instance_id AND i.execution_id = pe.execution_id
 			WHERE
 				i.state = ? AND i.completed_at IS NULL
 				AND (pe.visible_at IS NULL OR pe.visible_at <= ?)
@@ -57,6 +57,7 @@ func (mb *mysqlBackend) GetStats(ctx context.Context) (*backend.Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active instances: %w", err)
 	}
+	defer workflowRows.Close()
 
 	s.PendingWorkflowTasks = make(map[core.Queue]int64)
 
@@ -81,6 +82,7 @@ func (mb *mysqlBackend) GetStats(ctx context.Context) (*backend.Stats, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active activities: %w", err)
 	}
+	defer activityRows.Close()
 
 	s.PendingActivityTasks = make(map[core.Queue]int64)
 
